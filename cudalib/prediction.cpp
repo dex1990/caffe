@@ -1,17 +1,25 @@
-#include "caffe/caffe.hpp"
-#include <algorithm>
-#include <memory>
-#include <string>
-#include <vector>
+#include <pthread.h>
+#include <assert.h>
+#include <fstream>
 #include <sstream>
 #include <iostream>
-#include <pthread.h>
-#include<ctime>
+#include <cmath>
+#include <algorithm>
+#include <sys/stat.h>
+#include <time.h>
+#include <cuda.h>
+#include <cuda_runtime_api.h>
 
-using namespace caffe;
+#include "NvInfer.h"
+#include "NvCaffeParser.h"
+#define MAXDEVICENUM 16
+
+using namespace nvinfer1;
+using namespace nvcaffeparser1;
 using namespace std;
 
-#define MAXDEVICENUM 16
+const char* INPUT_BLOB_NAME = "data";
+const char* OUTPUT_BLOB_NAME = "prob";
 
 struct PthreadParams{
     int idx;
@@ -27,50 +35,97 @@ struct PthreadParams{
     char *model;
 };
 
-//shared_ptr<Net<float> > *nets;
-//float *data;
-//pthread_t *threads;
-//PthreadParams *params;
-//char *prototxt;
-//char *model;
-shared_ptr<Net<float> > nets[MAXDEVICENUM];
+class Logger : public nvinfer1::ILogger
+{
+  public:
+  void log(nvinfer1::ILogger::Severity severity, const char* msg) override
+  {
+    // suppress info-level messages
+        if (severity == Severity::kINFO) return;
+
+        switch (severity)
+        {
+            case Severity::kINTERNAL_ERROR: std::cerr << "INTERNAL_ERROR: "; break;
+            case Severity::kERROR: std::cerr << "ERROR: "; break;
+            case Severity::kWARNING: std::cerr << "WARNING: "; break;
+            case Severity::kINFO: std::cerr << "INFO: "; break;
+            default: std::cerr << "UNKNOWN: "; break;
+        }
+        std::cerr << msg << std::endl;
+  }
+};
+
+Logger gLogger[MAXDEVICENUM];
+IRuntime *runtimes[MAXDEVICENUM];
+ICudaEngine *engines[MAXDEVICENUM];
+IExecutionContext *contexts[MAXDEVICENUM];
 pthread_t threads[MAXDEVICENUM];
 PthreadParams params[MAXDEVICENUM];
 
+void caffeToGIEModel(const char *deployFile,       // name for caffe prototxt
+           const char *modelFile,        // name for model
+           const std::vector<std::string>& outputs,   // network outputs
+           unsigned int maxBatchSize,         // batch size - NB must be at least as large as the batch we want to run with)
+           IHostMemory *&gieModelStream,      // output buffer for the GIE model
+           int idx)
+{
+  // create the builder
+  printf("call caffeToGIEModel\n");
+  IBuilder* builder = createInferBuilder(gLogger[idx]);
+
+  // parse the caffe model to populate the network, then set the outputs
+  INetworkDefinition* network = builder->createNetwork();
+  ICaffeParser* parser = createCaffeParser();
+  const IBlobNameToTensor* blobNameToTensor = parser->parse(deployFile,modelFile,*network,DataType::kFLOAT);
+
+  // specify which tensors are outputs
+  for (auto& s : outputs)
+    network->markOutput(*blobNameToTensor->find(s.c_str()));
+
+  // Build the engine
+  builder->setMaxBatchSize(maxBatchSize);
+  builder->setMaxWorkspaceSize(1 << 20);
+
+  ICudaEngine* engine = builder->buildCudaEngine(*network);
+  assert(engine);
+
+  // we don't need the network any more, and we can destroy the parser
+  network->destroy();
+  parser->destroy();
+
+  // serialize the engine, then close everything down
+  gieModelStream = engine->serialize();
+  engine->destroy();
+  builder->destroy();
+  shutdownProtobufLibrary();
+  printf("call caffeToGIEModel done\n");
+}
+
 void* initgpu_thread(void *arg){
   PthreadParams *p = (PthreadParams *)arg;
-  Caffe::SetDevice(p->gpuidx);
-  Caffe::set_mode(Caffe::GPU);
-  nets[p->netidx].reset(new Net<float>(p->prototxt,caffe::TEST));
-  nets[p->netidx]->CopyTrainedLayersFrom(p->model);
-  nets[p->netidx]->ClearParamDiffs();
+  cudaSetDevice(p->gpuidx);
+  IHostMemory *gieModelStream{nullptr};
+  caffeToGIEModel(p->prototxt, p->model, std::vector < std::string > { OUTPUT_BLOB_NAME }, 1, gieModelStream,p->netidx);
+  runtimes[p->netidx] = createInferRuntime(gLogger[p->netidx]);
+  engines[p->netidx] = runtimes[p->netidx]->deserializeCudaEngine(gieModelStream->data(), gieModelStream->size(), nullptr);
+  if(gieModelStream){ 
+     gieModelStream->destroy();
+  }
+  contexts[p->netidx] = engines[p->netidx]->createExecutionContext();
 }
 
 int Init(int *gpus_,int gpunum_,int *nets_,int netnum_,char *prototxt_,char *model_){
   printf("Init ..\n");
-//  ::google::InitGoogleLogging("log.txt");
   int *gpus = gpus_;
   int *nets = nets_;
   int gpunum = gpunum_;
   if(gpunum > MAXDEVICENUM){
-      printf("error : gpu num(%d) is greater than MAXDECIVENUM(%d)\n",gpunum,MAXDEVICENUM);
+    printf("error : gpu num(%d) is greater than MAXDECIVENUM(%d)\n",gpunum,MAXDEVICENUM);
       return -1;
   }
-//  prototxt = prototxt_;
-//  model = model_;
   if(gpunum > 0){  
-   // nets = new;
-   // return -1; shared_ptr<Net<float> >[gpus];
-   // threads = new pthread_t[gpunum];
-   // params = new PthreadParams[gpunum];
     int i,j,k,ret;
     for(i = 0; i < gpunum;i++){
-/*      Caffe::SetDevice(i);
-      Caffe::set_mode(Caffe::GPU);
-      nets[i].reset(new Net<float>(prototxt,caffe::TEST));
-      nets[i]->CopyTrainedLayersFrom(model);
-      nets[i]->ClearParamDiffs();
-*/  
       printf("gpu idx : %d\n",gpus[i]);
       printf("net idx : %d\n",nets[i]);
       j = gpus[i];
@@ -100,46 +155,37 @@ extern "C" int Cudaclip(float *c,unsigned char *a,int w_,int h_,int idx_);
 
 void* rungpu_thread(void *arg){
   PthreadParams *p = (PthreadParams *)arg;
-//  clock_t start,finish;
-//  start = clock();
-  Caffe::SetDevice(p->gpuidx);
-  Caffe::set_mode(Caffe::GPU);
-//  finish = clock();
-//  printf("SetDevice cost time %d ms\n",(finish-start)/1000);
-/*  float *pdata = new float[p->w * p->h];
-  int i;
-  for(i = 0; i < p->w * p->h; i++){
-     pdata[i] = data[p->idx * p->step * p->w +i];
+  clock_t start,finish;
+  cudaError_t cudaStatus;
+  start = clock();
+  cudaSetDevice(p->gpuidx);
+  const ICudaEngine& engine = contexts[p->netidx]->getEngine();
+  assert(engine.getNbBindings() == 2);
+  void* buffers[2];
+  int inputIndex = engine.getBindingIndex(INPUT_BLOB_NAME),
+      outputIndex = engine.getBindingIndex(OUTPUT_BLOB_NAME);
+  cudaStatus = cudaMalloc(&buffers[inputIndex], p->n * p->h * p->w * sizeof(float));
+  if (cudaStatus != cudaSuccess) {
+     fprintf(stderr, "cudaMalloc failed!");
+     return NULL;
   }
-  printf("Thread %d input %f %f %f %f\n",p->idx,pdata[0], pdata[1],pdata[2],pdata[3]);
-*/
-  Blob<float>* input_blobs = nets[p->netidx]->input_blobs()[0];
-  input_blobs->Reshape(p->n,p->c,p->h,p->w);
-  nets[p->netidx]->Reshape();
-//  start = clock();
-//  cudaMemcpy(input_blobs->mutable_gpu_data(), &(data[p->idx * p->step * p->w]),
-//              sizeof(float) * input_blobs->count(), cudaMemcpyHostToDevice);
-  Cudacvt(input_blobs->mutable_gpu_data(), &(p->data[p->idx * p->step * p->w]),p->w,p->h,p->gpuidx);
-//  finish = clock();
-//  printf("cudaMemcpy cost time %d ms\n",(finish-start)/1000);
-//  start = clock();
-  nets[p->netidx]->Forward();
-//  finish = clock();
-//  printf("Forward cost time %d ms\n",(finish-start)/1000);
-//  start = clock();
-  Blob<float>* output_layer = nets[p->netidx]->output_blobs()[0];
-  float* begin = output_layer->mutable_gpu_data();
-  Cudaclip(begin,&(p->data[p->idx * p->step * p->w]),p->w,p->h,p->gpuidx);
-//  const float* begin = output_layer->cpu_data();
-/*  printf("thread %d %d %d %d %d\n",p->idx,output_layer->num(),output_layer->channels(),output_layer->height(),output_layer->width());
-  for(i = 0; i < p->w * p->h; i++){
-      data[p->idx * p->step * p->w + i] = begin[i];
+
+  cudaStatus = cudaMalloc(&buffers[outputIndex], p->n * p->h * p->w * sizeof(float));
+  if (cudaStatus != cudaSuccess) {
+     fprintf(stderr, "cudaMalloc failed!");
+     return NULL;
   }
-  printf("Thread %d error %f %f %f %f\n",p->idx,begin[0], begin[1],begin[2],begin[3]);
-  printf("Thread %d error %f %f %f %f\n",p->idx,output_layer->data_at(0,0,0,0), output_layer->data_at(0,0,0,1),output_layer->data_at(0,0,0,2),output_layer->data_at(0,0,0,3));
-  delete []pdata;*/
-//  memcpy(&(data[p->idx * p->step * p->w]),&(begin[0]),sizeof(float) * p->w * p->h);
-//  finish = clock();
+
+  cudaStream_t stream;
+  cudaStreamCreate(&stream);
+  Cudacvt((float *)buffers[inputIndex], &(p->data[p->idx * p->step * p->w]),p->w,p->h,p->gpuidx);
+  contexts[p->netidx]->enqueue(p->n, buffers, stream, nullptr);
+  Cudaclip((float *)buffers[outputIndex],&(p->data[p->idx * p->step * p->w]),p->w,p->h,p->gpuidx);
+  cudaStreamSynchronize(stream);
+  cudaStreamDestroy(stream);
+  cudaFree(buffers[inputIndex]);
+  cudaFree(buffers[outputIndex]);
+  finish = clock();
 //  printf("memcpy cost time %d ms\n",(finish-start)/1000);
 }
 
@@ -148,28 +194,8 @@ int Run(int *gpus_,int gpunum_,int *nets_,int netnum_,unsigned char *data_ptr,in
         int i,j,k,ret;
         int step_ = h_/gpunum_;
         clock_t start,finish;
-//        data = data_ptr;
         start = clock();
         for(i = 0;i < gpunum_ ; i++){
-  /*      Caffe::SetDevice(1);
-        Caffe::set_mode(Caffe::GPU);
-        Blob<float>* input_blobs = nets[i]->input_blobs()[0];
-        input_blobs->Reshape(1,1,h_,w_);
-        nets[i]->Reshape();
-        cudaMemcpy(input_blobs->mutable_gpu_data(), data,
-                    sizeof(float) * input_blobs->count(), cudaMemcpyHostToDevice);
-        for(int j =0 ;j<1;j++){
-            start = clock();
-            nets[i]->Forward();
-            finish = clock();
-            printf("Forward cost time %d ms\n",(finish-start)/1000);
-        }
-        Blob<float>* output_layer = nets[i]->output_blobs()[0];
-        const float* begin = output_layer->cpu_data();
-           for(i = 0; i < w_ * h_; i++){
-            data[i] = begin[i];
-       }*/
-//            params[i].idx = i;
             j = gpus_[i];
             k = nets_[i];
             params[k].step = step_;
@@ -193,25 +219,6 @@ int Run(int *gpus_,int gpunum_,int *nets_,int netnum_,unsigned char *data_ptr,in
             params[k].data = NULL;
         }
         finish = clock();
-//        printf("run thread cost time %d ms\n",(finish-start)/1000);
-
-//        start= clock();
-/*        float res_f;
-  
-        for(i = 0;i < w_*h_; i++){
-            res_f = (float)data_ptr[i] - data[i]*255.0;
-            if(res_f < 0)
-                res_f = 0;
-            if(res_f > 255.0)
-                res_f = 255.0;
-            data_ptr[i] = (unsigned char)res_f;
-        }
-  
-        delete []data;
-        finish = clock();
-        printf("copy data to ffmpeg cost time %d ms\n",(finish-start)/1000);
-*/
-//        data = NULL;
         return 0;
     }
 }
@@ -223,13 +230,10 @@ void Uninit(int *nets_,int netnum_){
   for(i = 0;i<netnum_;i++){
       printf("net idx : %d\n",nets_[i]);
       j = nets_[i];
-      memset(&(nets[j]),0,sizeof(shared_ptr<Net<float> >));
+      contexts[j]->destroy();
+      engines[j]->destroy();
+      runtimes[j]->destroy();
   }
-//  memset(nets,0,MAXDEVICENUM*sizeof(shared_ptr<Net<float> >));
-//  memset(threads,0,MAXDEVICENUM*sizeof(pthread_t));
-//  memset(params,0,MAXDEVICENUM*sizeof(PthreadParams));
-//  delete []threads;
-//  delete []params;
    printf("Uninit done\n");
 }
 
