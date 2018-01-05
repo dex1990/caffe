@@ -6,7 +6,7 @@
 #include <cmath>
 #include <algorithm>
 #include <sys/stat.h>
-#include <time.h>
+#include <sys/time.h>
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 
@@ -33,32 +33,22 @@ struct PthreadParams{
     unsigned char *data;
     char *prototxt;
     char *model;
+    int setdata;
 };
 
-class Logger : public nvinfer1::ILogger
+class Logger : public ILogger
 {
-  public:
   void log(nvinfer1::ILogger::Severity severity, const char* msg) override
   {
-    // suppress info-level messages
-        if (severity == Severity::kINFO) return;
-
-        switch (severity)
-        {
-            case Severity::kINTERNAL_ERROR: std::cerr << "INTERNAL_ERROR: "; break;
-            case Severity::kERROR: std::cerr << "ERROR: "; break;
-            case Severity::kWARNING: std::cerr << "WARNING: "; break;
-            case Severity::kINFO: std::cerr << "INFO: "; break;
-            default: std::cerr << "UNKNOWN: "; break;
-        }
-        std::cerr << msg << std::endl;
+     if (severity != Severity::kINFO)
+         std::cout << msg << std::endl;
   }
-};
-
-Logger gLogger[MAXDEVICENUM];
-IRuntime *runtimes[MAXDEVICENUM];
+}; 
+static Logger gLogger;
 ICudaEngine *engines[MAXDEVICENUM];
 IExecutionContext *contexts[MAXDEVICENUM];
+float* input_layer[MAXDEVICENUM];
+float* output_layer[MAXDEVICENUM];
 pthread_t threads[MAXDEVICENUM];
 PthreadParams params[MAXDEVICENUM];
 
@@ -66,53 +56,48 @@ void caffeToGIEModel(const char *deployFile,       // name for caffe prototxt
            const char *modelFile,        // name for model
            const std::vector<std::string>& outputs,   // network outputs
            unsigned int maxBatchSize,         // batch size - NB must be at least as large as the batch we want to run with)
-           IHostMemory *&gieModelStream,      // output buffer for the GIE model
-           int idx)
+           int gpuidx,
+           int netidx)
 {
   // create the builder
-  printf("call caffeToGIEModel\n");
-  IBuilder* builder = createInferBuilder(gLogger[idx]);
+//  printf("idx : %d\n",gpuidx);
+  cudaSetDevice(gpuidx);
+//  printf("call caffeToGIEModel\n");
+  IBuilder* builder = createInferBuilder(gLogger);
+//  printf("call createInferBuilder\n");
 
   // parse the caffe model to populate the network, then set the outputs
   INetworkDefinition* network = builder->createNetwork();
+//  printf("call builder->createNetwork\n");
   ICaffeParser* parser = createCaffeParser();
+//  printf("call createCaffeParser\n");
   const IBlobNameToTensor* blobNameToTensor = parser->parse(deployFile,modelFile,*network,DataType::kFLOAT);
+//  printf("call parser->parse\n");
 
   // specify which tensors are outputs
   for (auto& s : outputs)
     network->markOutput(*blobNameToTensor->find(s.c_str()));
-
+//  printf("call markOutput\n");
   // Build the engine
   builder->setMaxBatchSize(maxBatchSize);
-  builder->setMaxWorkspaceSize(1 << 20);
+//  printf("call setMaxBatchSize\n");
+  builder->setMaxWorkspaceSize(1 << 30);
+//  printf("call setMaxWorkspaceSize\n");
 
-  ICudaEngine* engine = builder->buildCudaEngine(*network);
-  assert(engine);
+  engines[netidx]  = builder->buildCudaEngine(*network);
+  assert(engines[netidx]);
+//  printf("call buildCudaEngine\n");
 
   // we don't need the network any more, and we can destroy the parser
   network->destroy();
-  parser->destroy();
-
-  // serialize the engine, then close everything down
-  gieModelStream = engine->serialize();
-  engine->destroy();
+//  printf("call network->destroy\n");
+//  parser->destroy();
+//  printf("call parser->destroy\n");
   builder->destroy();
-  shutdownProtobufLibrary();
-  printf("call caffeToGIEModel done\n");
+//  printf("call builder->destroy\n");
+//  printf("call caffeToGIEModel done\n");
 }
 
-void* initgpu_thread(void *arg){
-  PthreadParams *p = (PthreadParams *)arg;
-  cudaSetDevice(p->gpuidx);
-  IHostMemory *gieModelStream{nullptr};
-  caffeToGIEModel(p->prototxt, p->model, std::vector < std::string > { OUTPUT_BLOB_NAME }, 1, gieModelStream,p->netidx);
-  runtimes[p->netidx] = createInferRuntime(gLogger[p->netidx]);
-  engines[p->netidx] = runtimes[p->netidx]->deserializeCudaEngine(gieModelStream->data(), gieModelStream->size(), nullptr);
-  if(gieModelStream){ 
-     gieModelStream->destroy();
-  }
-  contexts[p->netidx] = engines[p->netidx]->createExecutionContext();
-}
 
 int Init(int *gpus_,int gpunum_,int *nets_,int netnum_,char *prototxt_,char *model_){
   printf("Init ..\n");
@@ -135,11 +120,10 @@ int Init(int *gpus_,int gpunum_,int *nets_,int netnum_,char *prototxt_,char *mod
       params[k].netidx = k;
       params[k].prototxt = prototxt_;
       params[k].model = model_;
-      ret = pthread_create(&threads[k],NULL,initgpu_thread,&params[k]);
-    }
-    for(i = 0;i < gpunum;i++){
-        k = nets[i];
-        pthread_join(threads[k],NULL);
+      params[k].setdata = 0;
+      caffeToGIEModel(prototxt_, model_, std::vector < std::string > { OUTPUT_BLOB_NAME }, 1, j,k);
+      cudaSetDevice(j);
+      contexts[k] = engines[k]->createExecutionContext();
     }
     printf("Init done\n");
     return 0;
@@ -155,46 +139,29 @@ extern "C" int Cudaclip(float *c,unsigned char *a,int w_,int h_,int idx_);
 
 void* rungpu_thread(void *arg){
   PthreadParams *p = (PthreadParams *)arg;
-  clock_t start,finish;
   cudaError_t cudaStatus;
-  start = clock();
   cudaSetDevice(p->gpuidx);
-  const ICudaEngine& engine = contexts[p->netidx]->getEngine();
-  assert(engine.getNbBindings() == 2);
-  void* buffers[2];
-  int inputIndex = engine.getBindingIndex(INPUT_BLOB_NAME),
-      outputIndex = engine.getBindingIndex(OUTPUT_BLOB_NAME);
-  cudaStatus = cudaMalloc(&buffers[inputIndex], p->n * p->h * p->w * sizeof(float));
-  if (cudaStatus != cudaSuccess) {
-     fprintf(stderr, "cudaMalloc failed!");
-     return NULL;
+  if(p->setdata == 0){
+     printf("create GPU buffers\n");
+     cudaMalloc((void **)(&(input_layer[p->netidx])), p->n * p->w * p->h * sizeof(float));
+     cudaMalloc((void **)(&(output_layer[p->netidx])), p->n * p->w * p->h *sizeof(float));
+     printf("create GPU buffers done\n");
+     p->setdata = 1;
   }
+  assert(engines[p->netidx]->getNbBindings() == 2);
+  void* buffers[2] = {input_layer[p->netidx],output_layer[p->netidx]};;
+  int inputIndex = engines[p->netidx]->getBindingIndex(INPUT_BLOB_NAME),
+      outputIndex = engines[p->netidx]->getBindingIndex(OUTPUT_BLOB_NAME);
 
-  cudaStatus = cudaMalloc(&buffers[outputIndex], p->n * p->h * p->w * sizeof(float));
-  if (cudaStatus != cudaSuccess) {
-     fprintf(stderr, "cudaMalloc failed!");
-     return NULL;
-  }
-
-  cudaStream_t stream;
-  cudaStreamCreate(&stream);
   Cudacvt((float *)buffers[inputIndex], &(p->data[p->idx * p->step * p->w]),p->w,p->h,p->gpuidx);
-  contexts[p->netidx]->enqueue(p->n, buffers, stream, nullptr);
+  contexts[p->netidx]->execute(p->n, buffers);
   Cudaclip((float *)buffers[outputIndex],&(p->data[p->idx * p->step * p->w]),p->w,p->h,p->gpuidx);
-  cudaStreamSynchronize(stream);
-  cudaStreamDestroy(stream);
-  cudaFree(buffers[inputIndex]);
-  cudaFree(buffers[outputIndex]);
-  finish = clock();
-//  printf("memcpy cost time %d ms\n",(finish-start)/1000);
 }
 
 int Run(int *gpus_,int gpunum_,int *nets_,int netnum_,unsigned char *data_ptr,int w_,int h_){
     if(gpunum_ > 0){
         int i,j,k,ret;
         int step_ = h_/gpunum_;
-        clock_t start,finish;
-        start = clock();
         for(i = 0;i < gpunum_ ; i++){
             j = gpus_[i];
             k = nets_[i];
@@ -218,7 +185,6 @@ int Run(int *gpus_,int gpunum_,int *nets_,int netnum_,unsigned char *data_ptr,in
             pthread_join(threads[k],NULL);
             params[k].data = NULL;
         }
-        finish = clock();
         return 0;
     }
 }
@@ -228,11 +194,12 @@ void Uninit(int *nets_,int netnum_){
   printf("Uninit...\n");
   int i,j;
   for(i = 0;i<netnum_;i++){
-      printf("net idx : %d\n",nets_[i]);
+//      printf("net idx : %d\n",nets_[i]);
       j = nets_[i];
       contexts[j]->destroy();
+      cudaFree(input_layer[j]);
+      cudaFree(output_layer[j]);
       engines[j]->destroy();
-      runtimes[j]->destroy();
   }
    printf("Uninit done\n");
 }
@@ -250,7 +217,7 @@ int pred_init(int *gpus_,int gpunum_,int *nets_,int netnum_,char *prototxt_file_
         }
         return ret;
     }else{
-        printf("Init gpu error : gpus <= 0\n");
+        printf("Init gpu error : gpunum <= 0\n");
         return -1;
     }
 }
